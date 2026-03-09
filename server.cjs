@@ -1,257 +1,288 @@
 #!/usr/bin/env node
 "use strict";
 
+/**
+ * server.cjs v2 — Learning swarm orchestrator.
+ *
+ * Composes: SwarmBus, SwarmReactor, ResourceRegistry, LockManager,
+ *           AckTracker, DecisionBridge
+ *
+ * Architecture:
+ *   worker events → bus → reactor → decision bridge → pattern files
+ *   pattern files → (external agent) → playbooks → controller policy
+ *
+ * HTTP API is backward-compatible with v1.
+ * New endpoints expose the full intelligence substrate.
+ */
+
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const { execSync, spawn } = require("child_process");
+const { SwarmBus, SWARM_ROOT } = require("./swarm-bus.cjs");
+const { SwarmReactor } = require("./swarm-reactor.cjs");
+const { DecisionBridge } = require("./decision-bridge.cjs");
+const { uuid } = require("./schema.cjs");
 
-const PORT = 3456;
+const PORT = parseInt(process.env.PORT, 10) || 3456;
 const TMUX_CONTROL = path.join(__dirname, "tmux-control.cjs");
 const PUBLIC_DIR = path.join(__dirname, "public");
+const CLI_PATH = path.join(__dirname, "swarm-cli.cjs");
 const MAX_BUFFER_LINES = 500;
-const POLL_INTERVAL_MS = 2000;
 
-// --- SYSTEM_PROMPT (reused from start.cjs) ---
+// ─── System Prompt ──────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `You are a senior staff software engineer and expert technical lead. Your role is to decompose complex projects into parallel workstreams and delegate them across multiple Claude Code terminals. You think architecturally — breaking systems into clean modules with clear interfaces — and you manage your team of AI coders like a seasoned engineering manager: precise task assignments, clear ownership boundaries, and aggressive parallelization. You never do the coding yourself — you delegate everything and monitor progress.
+function buildSystemPrompt() {
+  return `You are a senior staff software engineer and expert technical lead. Your role is to decompose complex projects into parallel workstreams and delegate them across multiple Claude Code terminals.
 
-You have the following tool available — a CLI script you run via shell:
+You have the following tools available:
 
 ## tmux-control.cjs commands
 
-# Start a new terminal (opens a macOS Terminal window with Claude Code-ready env)
 node ${TMUX_CONTROL} --start <name> <working-dir>
-
-# Send a command to a terminal
-node ${TMUX_CONTROL} --cmd <name> "your instruction here"
-
-# Send blank Enter (accept prompts, approve plans, dismiss ghost text)
+node ${TMUX_CONTROL} --cmd <name> "instruction"
 node ${TMUX_CONTROL} --cmd <name> ""
-
-# Read output from a terminal (default 50 lines, or specify count)
 node ${TMUX_CONTROL} --read <name>
 node ${TMUX_CONTROL} --read <name> 100
-
-# Stop a specific terminal
 node ${TMUX_CONTROL} --stop <name>
-
-# Stop all terminals
 node ${TMUX_CONTROL} --stop-all
-
-# List active terminals
 node ${TMUX_CONTROL} --list
+
+## Swarm Protocol — MANDATORY for every child
+
+When sending a task to a child terminal named "<NAME>", you MUST append these instructions after your task:
+
+\`\`\`
+## Swarm Communication
+
+You have a helper CLI for reporting status. Use it instead of raw echo:
+
+# Set env (do this once after Claude Code starts):
+export SWARM_SESSION="<NAME>"
+export SWARM_ROOT="/tmp/swarm"
+
+# Report progress:
+node ${CLI_PATH} event progress --pct <0-100> --file <path> --next "<next step>"
+
+# Before writing a file, request lock:
+node ${CLI_PATH} event intent_write --file <path>
+
+# After writing a file:
+node ${CLI_PATH} event file_written --file <path> --summary "<what>"
+
+# If blocked on another worker:
+node ${CLI_PATH} event blocked --need "<resource_id>" --from "<worker>"
+
+# When done:
+node ${CLI_PATH} event done --file <path1> --file <path2> --summary "<what you built>"
+
+# If you made an architectural decision:
+node ${CLI_PATH} event decision --chosen "<choice>" --options "<a>,<b>" --confidence <0-1>
+
+# Check coordinator messages:
+node ${CLI_PATH} inbox read --tail 5
+
+# Read your current state:
+node ${CLI_PATH} state
+
+Do these after EVERY significant action. The swarm coordinator depends on your reports.
+\`\`\`
+
+Replace <NAME> with the actual terminal session name.
+
+## Reading child status
+
+Prefer structured events over terminal scraping:
+  cat /tmp/swarm/<name>/out.jsonl | tail -20
+
+To send messages to a child:
+  echo '{"msg_id":"x","type":"redirect","ts":"...","requires_ack":true,"payload":{"message":"..."}}' >> /tmp/swarm/<name>/in.jsonl
 
 ## Workflow
 
-1. Break the goal into small, focused sub-tasks — one per terminal
-2. Start ALL terminals at once with descriptive names (e.g. "ui", "api", "tests")
-3. In each terminal, launch Claude Code: --cmd <name> "claude --dangerously-skip-permissions --model <MODEL>"
-4. Wait a few seconds, then send a blank Enter: --cmd <name> ""
-5. Send a SHORT, FOCUSED task to each terminal — one specific thing per terminal
-6. IMPORTANT: Always follow every --cmd with a blank Enter after ~1 second: --cmd <name> ""
-7. Poll terminals with --read to check progress
-8. When done, exit Claude Code in each terminal: --cmd <name> "/exit"
-9. Clean up: --stop-all
+1. Break goal into focused sub-tasks — one per terminal
+2. Start ALL terminals at once with descriptive names
+3. Launch Claude Code in each: --cmd <name> "claude --dangerously-skip-permissions --model <MODEL>"
+4. Wait a few seconds, then blank Enter: --cmd <name> ""
+5. Send task with FULL swarm protocol instructions above
+6. ALWAYS follow --cmd with blank Enter after ~1 second
+7. Monitor via swarm bus AND terminal reads
+8. When done: --cmd <name> "/exit" then --stop-all
 
-## MANDATORY: MAXIMIZE PARALLEL TERMINALS
+## Parallel Execution — MANDATORY
 
-You MUST split work across AS MANY terminals as possible. The whole point of this system is parallelism. More terminals = faster delivery.
-
-**Minimum 3 terminals, aim for 4-6 for any non-trivial task.**
-
-Think of it like a dev team — you wouldn't assign one developer to build an entire app. You'd have one on the data layer, one on the UI components, one on styling, one on utilities, one on tests, etc.
-
-Example — "Build a ball drop game with Three.js":
-WRONG (2 terminals, too few):
-- Terminal 1: obstacles.js (all obstacles)
-- Terminal 2: index.html (everything else)
-
-RIGHT (5 terminals, properly distributed):
-- Terminal 1: "Create obstacles.js with 8 obstacle factory functions for Three.js + cannon-es. Each returns {meshes, bodies, update}. You own obstacles.js only."
-- Terminal 2: "Create physics.js — cannon-es world setup, ball body, gravity, contact materials, stuck detection + reset. You own physics.js only."
-- Terminal 3: "Create renderer.js — Three.js scene, camera follow with lerp + shake, sky-to-hell color gradient based on depth, fog, lighting. You own renderer.js only."
-- Terminal 4: "Create ui.js — HTML overlay showing depth, speed, max depth. Depth milestone popups at 10m, 50m, 100m, 500m. You own ui.js only."
-- Terminal 5: "Create index.html — imports all modules, runs the game loop, procedurally spawns obstacles ahead of the ball, cleans up old ones. You own index.html only."
-
-Each terminal gets ONE file or ONE responsibility. Be precise about what it owns and how it connects to the others.
-
-## Reading output — what to look for
-
-- ">" prompt = Claude Code is idle, ready for next command
-- Working indicators (e.g. "Analyzing...", "Writing...") = still working, keep polling
-- "Yes, I trust this folder" = trust prompt, send blank Enter
-- "Entered plan mode" = wants approval, send blank Enter
-- Task complete = you'll see a summary and the ">" prompt returns
-
-## Parallel execution — USE MULTIPLE TERMINALS
-
-ALWAYS default to running multiple terminals in parallel. Speed is the priority. Start all terminals upfront and give each one its task immediately — do NOT wait for one to finish before starting the next.
-
-There are NO conflicts as long as your instructions to each terminal are precise about what files and directories it owns. This is easy — just be explicit in every prompt.
-
-**How to split work:**
-- Give each terminal a distinct area (e.g. "ui" owns src/components/, "api" owns src/api/, "tests" only reads and runs tests)
-- In each prompt, state exactly: "You own <directory>. Do NOT create or edit files outside this directory."
-- Start ALL terminals at once and send their tasks immediately
-- For dependent work, start both — have the dependent one scaffold its own area while waiting, then integrate once the dependency is ready
-
-**Simple rule:** If the task can be split into 2+ areas, split it and run in parallel. The only thing that matters is giving clear, non-overlapping ownership in each prompt.
+Minimum 3 terminals, aim for 4-6. Each terminal gets ONE file or ONE responsibility.
+Be explicit about file ownership in every prompt.
 
 ## Verification — MANDATORY before completion
 
-You MUST verify that everything works before declaring the task done. NEVER hand off a project without testing it first.
+Test everything: run servers, hit endpoints, check UI, run test suites. Loop until clean.
 
-**Frontend work:**
-- Start the dev server and confirm it runs without errors
-- Use a terminal to take screenshots (e.g. \`npx playwright screenshot\`, \`screencapture\`, or have Claude Code use its screenshot tool) and verify the UI looks correct
-- Check the browser console for errors by reading the terminal output
-- Test key user flows — click through the app, fill forms, navigate pages
+## Important Rules
 
-**Backend work:**
-- Start the server and confirm it boots without errors
-- Hit key API endpoints with curl and verify responses (correct status codes, expected data)
-- Check logs for warnings or errors
-- Run any existing test suites
+- ALWAYS blank Enter after every command
+- ALWAYS include full swarm protocol in every child task
+- Include export SWARM_SESSION=<name> in each child's setup
+- Use descriptive session names
+- DEFAULT to parallel execution`;
+}
 
-**Full-stack work:**
-- Do ALL of the above
-- Verify frontend can talk to backend (API calls succeed, data renders)
-
-**General:**
-- Run the project's test suite if one exists (\`npm test\`, \`pytest\`, etc.)
-- Run linters/type checks if configured (\`npm run lint\`, \`tsc --noEmit\`, etc.)
-- If any test or check fails, fix it before finishing — loop until clean
-- Summarize verification results when reporting completion: what you tested, what passed
-
-## Important rules
-
-- ALWAYS use --cmd <name> "" (blank Enter) after every --cmd <name> "text" to handle ghost text
-- Wait a few seconds between starting a terminal and sending commands
-- Use descriptive session names that match the task purpose
-- DEFAULT to running multiple terminals in parallel — speed matters more than caution
-- Start ALL terminals at once and send tasks immediately, don't serialize unnecessarily
-`;
-
-// --- State ---
+// ─── State ──────────────────────────────────────────────────────────────────
 
 const state = {
   running: false,
   controllerProcess: null,
-  controllerOutput: [],   // ring buffer, max MAX_BUFFER_LINES
+  controllerOutput: [],
   goal: "",
   terminalCount: "auto",
   model: "sonnet",
-  iterations: 0,          // total iterations requested
-  currentIteration: 0,    // 0 = initial build, 1+ = improvement iterations
+  iterations: 0,
+  currentIteration: 0,
+  stopped: false,
   sessions: [],
   sseClients: [],
-  pollInterval: null,
+  // Subsystems
+  bus: null,
+  reactor: null,
+  bridge: null,
 };
 
-// --- Helpers ---
+// ─── Helpers ────────────────────────────────────────────────────────────────
 
-function stripAnsi(str) {
-  return str.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
+function stripAnsi(s) {
+  return s.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
 }
 
-function pushControllerLine(line) {
+function pushLine(line) {
   state.controllerOutput.push(line);
-  if (state.controllerOutput.length > MAX_BUFFER_LINES) {
-    state.controllerOutput.shift();
-  }
+  if (state.controllerOutput.length > MAX_BUFFER_LINES) state.controllerOutput.shift();
 }
 
 function broadcast(event, data) {
   const msg = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   for (let i = state.sseClients.length - 1; i >= 0; i--) {
-    try {
-      state.sseClients[i].write(msg);
-    } catch (_) {
-      state.sseClients.splice(i, 1);
-    }
+    try { state.sseClients[i].write(msg); }
+    catch (_) { state.sseClients.splice(i, 1); }
   }
 }
 
 function runTmux(...args) {
   try {
     return execSync(`node ${TMUX_CONTROL} ${args.join(" ")}`, {
-      encoding: "utf-8",
-      timeout: 15000,
+      encoding: "utf-8", timeout: 15000,
     }).trimEnd();
   } catch (e) {
     return e.stdout ? e.stdout.trimEnd() : "";
   }
 }
 
+// ─── Subsystem Lifecycle ────────────────────────────────────────────────────
+
+function initSubsystems() {
+  destroySubsystems();
+
+  const runId = uuid();
+  state.bus = new SwarmBus(runId);
+  state.reactor = new SwarmReactor(state.bus);
+  state.bridge = new DecisionBridge(state.reactor);
+
+  // Wire reactor → SSE
+  state.reactor.on("event", (e) => broadcast("swarm:event", e));
+  state.reactor.on("log", (e) => {
+    pushLine(`[${e.level}] ${e.session}: ${e.message}`);
+    broadcast("swarm:log", e);
+  });
+  state.reactor.on("progress", (e) => broadcast("swarm:progress", e));
+  state.reactor.on("swarm:complete", (e) => broadcast("swarm:complete", e));
+  state.reactor.on("stall", (e) => broadcast("swarm:stall", e));
+  state.reactor.on("delivery_failure", (e) => broadcast("swarm:delivery_failure", e));
+
+  // Wire bridge → SSE
+  state.bridge.on("decision:captured", (e) => broadcast("swarm:decision", e));
+  state.bridge.on("pattern:compiled", (e) => broadcast("swarm:pattern", e));
+  state.bridge.on("run:complete", (e) => broadcast("swarm:run_complete", e));
+
+  state.reactor.start();
+  state.bridge.start();
+}
+
+function destroySubsystems() {
+  if (state.bridge) { state.bridge.stop(); state.bridge = null; }
+  if (state.reactor) { state.reactor.stop(); state.reactor = null; }
+  if (state.bus) { state.bus.destroy(); state.bus = null; }
+}
+
+// ─── Tmux Session Enumeration ───────────────────────────────────────────────
+// Hybrid: bus handles real-time data, this handles session discovery.
+
+let pollInterval = null;
+
 function pollTerminals() {
   try {
-    const listOutput = runTmux("--list");
+    const out = runTmux("--list");
     const sessions = [];
-    if (listOutput && !listOutput.includes("No active sessions")) {
-      const lines = listOutput.split("\n");
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed && trimmed !== "Active sessions:") {
-          sessions.push(trimmed);
+    if (out && !out.includes("No active sessions")) {
+      for (const line of out.split("\n")) {
+        const t = line.trim();
+        if (t && t !== "Active sessions:") {
+          sessions.push(t);
+          if (state.bus && !state.bus.sessions.has(t)) {
+            state.bus.register(t);
+          }
         }
       }
     }
     state.sessions = sessions;
-
     broadcast("terminals", { sessions });
   } catch (_) {}
 }
 
 function startPolling() {
-  if (state.pollInterval) return;
-  state.pollInterval = setInterval(pollTerminals, POLL_INTERVAL_MS);
-  // Do an immediate poll
+  if (pollInterval) return;
+  pollInterval = setInterval(pollTerminals, 3000);
   pollTerminals();
 }
 
 function stopPolling() {
-  if (state.pollInterval) {
-    clearInterval(state.pollInterval);
-    state.pollInterval = null;
-  }
+  if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
 }
 
-// --- Controller process ---
+// ─── Controller Process ─────────────────────────────────────────────────────
 
 function buildPrompt(goal, terminalCount, model, iteration) {
-  let terminalInstruction = "";
-  if (terminalCount === "auto") {
-    terminalInstruction = "Decide how many terminals to use based on the goal. If possible, operate in parallel to improve dev speed.";
-  } else {
-    terminalInstruction = `Use exactly ${terminalCount} terminal(s). Name them appropriately for the task.`;
-  }
+  const tc = terminalCount === "auto"
+    ? "Decide how many terminals to use. Prefer parallel."
+    : `Use exactly ${terminalCount} terminal(s).`;
 
-  const modelInstruction = `When launching Claude Code in each terminal, use: claude --dangerously-skip-permissions --model ${model || "sonnet"}`;
+  const mi = `When launching Claude Code: claude --dangerously-skip-permissions --model ${model || "sonnet"}`;
 
-  let goalSection = "";
-  if (iteration === 0) {
-    goalSection = `## Your Goal\n\n${goal}`;
-  } else {
-    goalSection = `## Iteration ${iteration} — Improvement Round
+  const gs = iteration === 0
+    ? `## Your Goal\n\n${goal}`
+    : `## Iteration ${iteration} — Improvement\n\n1. Code review\n2. Fix issues\n3. Add 1 feature\n4. Verify\n\nOriginal: ${goal}`;
 
-The project below was already built in a previous round. Your job now:
+  // Check for existing playbooks
+  let playbookSection = "";
+  try {
+    const playbooks = fs.readFileSync(path.join(SWARM_ROOT, "_decisions", "patterns.jsonl"), "utf-8").trim();
+    if (playbooks) {
+      const recent = playbooks.split("\n").slice(-3).map((l) => {
+        try { return JSON.parse(l); } catch (_) { return null; }
+      }).filter(Boolean);
 
-1. **Code review**: Open the project, read through the codebase, identify issues (bugs, code quality, missing error handling, UX problems, performance)
-2. **Fix and improve**: Address the issues you found. Refactor where needed, fix bugs, improve code quality.
-3. **Add 1 new feature**: Think about what would make this project better and add one meaningful new feature that fits naturally.
-4. **Verify everything**: Run the project, test it works (including your new feature), ensure nothing is broken.
+      if (recent.length > 0) {
+        playbookSection = `\n## Lessons from Previous Runs\n\n${recent.map((p) =>
+          `- ${p.outcome}: ${p.worker_count} workers, ${p.blockers?.length || 0} blockers, ${p.conflicts?.length || 0} conflicts. ${(p.recommended_improvements || []).map((i) => i.reason).join("; ")}`
+        ).join("\n")}\n\nApply these lessons to your decomposition.`;
+      }
+    }
+  } catch (_) {}
 
-Original goal for context: ${goal}`;
-  }
-
-  return `${SYSTEM_PROMPT}\n\n## Terminal count\n\n${terminalInstruction}\n\n## Model\n\n${modelInstruction}\n\n${goalSection}`;
+  return `${buildSystemPrompt()}\n\n## Terminal count\n\n${tc}\n\n## Model\n\n${mi}\n\n${gs}${playbookSection}`;
 }
 
 function spawnController(goal, terminalCount, model, iteration) {
   const prompt = buildPrompt(goal, terminalCount, model, iteration || 0);
-
-  const env = Object.assign({}, process.env);
+  const env = { ...process.env };
   delete env.CLAUDECODE;
 
   const child = spawn("claude", [
@@ -274,126 +305,90 @@ function spawnController(goal, terminalCount, model, iteration) {
   state.controllerOutput = [];
   state.sessions = [];
 
-  broadcast("status", { running: true, goal, terminalCount });
+  broadcast("status", { running: true, goal, terminalCount, iteration });
 
   let lineBuf = "";
 
-  const processJsonLine = (raw) => {
+  const processJson = (raw) => {
     if (!raw.trim()) return;
     try {
       const msg = JSON.parse(raw);
       let line = null;
 
-      // stream-json message types we care about:
       if (msg.type === "assistant" && msg.message) {
-        // Assistant text/tool_use blocks
-        const content = msg.message.content || [];
-        for (const block of content) {
-          if (block.type === "text" && block.text) {
-            line = block.text;
-          } else if (block.type === "tool_use") {
-            const input = block.input || {};
-            if (input.command) {
-              line = "$ " + input.command;
-            } else {
-              line = "[tool: " + block.name + "]";
+        for (const block of msg.message.content || []) {
+          if (block.type === "text" && block.text) line = block.text;
+          else if (block.type === "tool_use") {
+            const inp = block.input || {};
+            line = inp.command ? "$ " + inp.command : "[tool: " + block.name + "]";
+
+            // Auto-register sessions
+            if (inp.command && state.bus) {
+              const m = inp.command.match(/--start\s+(\S+)/);
+              if (m && !state.bus.sessions.has(m[1])) {
+                state.bus.register(m[1]);
+              }
             }
           }
           if (line) {
-            // Split multi-line text into individual lines
-            for (const l of line.split("\n")) {
-              pushControllerLine(l);
-              broadcast("controller", { line: l });
-            }
+            for (const l of line.split("\n")) { pushLine(l); broadcast("controller", { line: l }); }
             line = null;
           }
         }
       } else if (msg.type === "result" && msg.result) {
-        // Final result text
-        const text = typeof msg.result === "string" ? msg.result : (msg.result.text || "");
-        if (text) {
-          for (const l of text.split("\n")) {
-            pushControllerLine(l);
-            broadcast("controller", { line: l });
-          }
-        }
-      } else if (msg.type === "content_block_delta" && msg.delta) {
-        // Streaming text delta
-        const text = msg.delta.text || "";
-        if (text) {
-          for (const l of text.split("\n")) {
-            if (l) {
-              pushControllerLine(l);
-              broadcast("controller", { line: l });
-            }
-          }
+        const t = typeof msg.result === "string" ? msg.result : (msg.result.text || "");
+        for (const l of t.split("\n")) { pushLine(l); broadcast("controller", { line: l }); }
+      } else if (msg.type === "content_block_delta" && msg.delta?.text) {
+        for (const l of msg.delta.text.split("\n")) {
+          if (l) { pushLine(l); broadcast("controller", { line: l }); }
         }
       }
     } catch (_) {
-      // Not valid JSON, emit raw
-      pushControllerLine(raw);
+      pushLine(raw);
       broadcast("controller", { line: raw });
     }
   };
 
-  const handleStdout = (chunk) => {
+  child.stdout.on("data", (chunk) => {
     lineBuf += chunk.toString();
     const parts = lineBuf.split("\n");
     lineBuf = parts.pop();
-    for (const line of parts) {
-      processJsonLine(line);
-    }
-  };
+    for (const p of parts) processJson(p);
+  });
 
-  const handleStderr = (chunk) => {
-    const text = stripAnsi(chunk.toString());
-    for (const line of text.split("\n")) {
-      if (line.trim()) {
-        pushControllerLine(line);
-        broadcast("controller", { line });
-      }
+  child.stderr.on("data", (chunk) => {
+    for (const l of stripAnsi(chunk.toString()).split("\n")) {
+      if (l.trim()) { pushLine(l); broadcast("controller", { line: l }); }
     }
-  };
-
-  child.stdout.on("data", handleStdout);
-  child.stderr.on("data", handleStderr);
+  });
 
   child.on("exit", (code) => {
-    // Flush remaining buffer
-    if (lineBuf.length > 0) {
-      processJsonLine(lineBuf);
-      lineBuf = "";
-    }
+    if (lineBuf) { processJson(lineBuf); lineBuf = ""; }
     state.controllerProcess = null;
     stopPolling();
-
-    // Cleanup tmux sessions
     try { runTmux("--stop-all"); } catch (_) {}
     state.sessions = [];
     broadcast("terminals", { sessions: [] });
 
-    // Check if we should start the next iteration
     if (code === 0 && state.currentIteration < state.iterations && !state.stopped) {
       state.currentIteration++;
-      const iterMsg = `\n--- Iteration ${state.currentIteration} of ${state.iterations} starting ---\n`;
-      pushControllerLine(iterMsg);
-      broadcast("controller", { line: iterMsg });
-      broadcast("status", { running: true, currentIteration: state.currentIteration, iterations: state.iterations });
+      pushLine(`\n--- Iteration ${state.currentIteration} of ${state.iterations} ---`);
+      broadcast("controller", { line: `--- Iteration ${state.currentIteration} ---` });
+      broadcast("status", { running: true, currentIteration: state.currentIteration });
 
-      // Small delay before next iteration
-      setTimeout(() => {
-        spawnController(state.goal, state.terminalCount, state.model, state.currentIteration);
-      }, 2000);
+      // Re-init for fresh iteration (decision bridge persists across iterations)
+      destroySubsystems();
+      initSubsystems();
+
+      setTimeout(() => spawnController(state.goal, state.terminalCount, state.model, state.currentIteration), 2000);
     } else {
       state.running = false;
-      const reason = state.stopped ? "Stopped by user" : `Controller exited with code ${code}`;
-      pushControllerLine(`\n[${reason}]`);
-      broadcast("controller", { line: `\n[${reason}]` });
-      if (state.iterations > 0 && code === 0 && !state.stopped) {
-        pushControllerLine(`[All ${state.iterations} iteration(s) complete]`);
-        broadcast("controller", { line: `[All ${state.iterations} iteration(s) complete]` });
-      }
+      const reason = state.stopped ? "Stopped" : `Exit ${code}`;
+      pushLine(`\n[${reason}]`);
+      broadcast("controller", { line: `[${reason}]` });
       broadcast("status", { running: false });
+      // Don't destroy subsystems immediately — let bridge finalize
+      setTimeout(() => destroySubsystems(), 5000);
       state.stopped = false;
     }
   });
@@ -405,151 +400,197 @@ function stopController() {
   state.stopped = true;
   if (state.controllerProcess) {
     state.controllerProcess.kill("SIGTERM");
-    // Give it a moment, then force kill
     setTimeout(() => {
-      if (state.controllerProcess) {
-        try { state.controllerProcess.kill("SIGKILL"); } catch (_) {}
-      }
+      if (state.controllerProcess) try { state.controllerProcess.kill("SIGKILL"); } catch (_) {}
     }, 3000);
   }
   try { runTmux("--stop-all"); } catch (_) {}
   stopPolling();
+  destroySubsystems();
   state.running = false;
   state.sessions = [];
-
   broadcast("status", { running: false });
   broadcast("terminals", { sessions: [] });
 }
 
-// --- HTTP Server ---
+// ─── HTTP ───────────────────────────────────────────────────────────────────
 
 function parseBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = "";
-    req.on("data", (chunk) => { body += chunk; });
-    req.on("end", () => {
-      try { resolve(JSON.parse(body)); }
-      catch (_) { resolve({}); }
-    });
-    req.on("error", reject);
+  return new Promise((resolve) => {
+    let b = "";
+    req.on("data", (c) => { b += c; });
+    req.on("end", () => { try { resolve(JSON.parse(b)); } catch (_) { resolve({}); } });
+    req.on("error", () => resolve({}));
   });
 }
 
-function sendJson(res, status, data) {
-  res.writeHead(status, { "Content-Type": "application/json" });
+function json(res, status, data) {
+  res.writeHead(status, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
   res.end(JSON.stringify(data));
 }
 
-const MIME_TYPES = {
-  ".html": "text/html",
-  ".css": "text/css",
-  ".js": "application/javascript",
-  ".json": "application/json",
-  ".png": "image/png",
-  ".svg": "image/svg+xml",
-  ".ico": "image/x-icon",
+const MIME = {
+  ".html": "text/html", ".css": "text/css", ".js": "application/javascript",
+  ".json": "application/json", ".png": "image/png", ".svg": "image/svg+xml",
 };
 
 const server = http.createServer(async (req, res) => {
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+    });
+    return res.end();
+  }
+
   const url = new URL(req.url, `http://localhost:${PORT}`);
-  const pathname = url.pathname;
+  const p = url.pathname;
 
-  // --- API Routes ---
+  // ── Core API (backward compat) ──
 
-  if (pathname === "/api/start" && req.method === "POST") {
-    if (state.running) {
-      return sendJson(res, 400, { error: "Already running" });
-    }
+  if (p === "/api/start" && req.method === "POST") {
+    if (state.running) return json(res, 400, { error: "Already running" });
     const body = await parseBody(req);
     const goal = (body.goal || "").trim();
-    if (!goal) {
-      return sendJson(res, 400, { error: "Goal is required" });
-    }
-    const terminalCount = body.terminalCount === "auto" || !body.terminalCount
-      ? "auto"
-      : parseInt(body.terminalCount, 10);
+    if (!goal) return json(res, 400, { error: "Goal required" });
+    const tc = body.terminalCount === "auto" || !body.terminalCount ? "auto" : parseInt(body.terminalCount, 10);
     const model = body.model || "sonnet";
     const iterations = Math.min(Math.max(parseInt(body.iterations) || 0, 0), 5);
-
     state.iterations = iterations;
     state.currentIteration = 0;
     state.stopped = false;
-
-    spawnController(goal, terminalCount, model, 0);
-    return sendJson(res, 200, { ok: true });
+    initSubsystems();
+    spawnController(goal, tc, model, 0);
+    return json(res, 200, { ok: true });
   }
 
-  if (pathname === "/api/stop" && req.method === "POST") {
+  if (p === "/api/stop" && req.method === "POST") {
     stopController();
-    return sendJson(res, 200, { ok: true });
+    return json(res, 200, { ok: true });
   }
 
-  if (pathname === "/api/status" && req.method === "GET") {
-    return sendJson(res, 200, {
-      running: state.running,
-      goal: state.goal,
-      terminalCount: state.terminalCount,
-      model: state.model,
-      iterations: state.iterations,
-      currentIteration: state.currentIteration,
+  if (p === "/api/status" && req.method === "GET") {
+    return json(res, 200, {
+      running: state.running, goal: state.goal, terminalCount: state.terminalCount,
+      model: state.model, iterations: state.iterations, currentIteration: state.currentIteration,
       sessions: state.sessions,
     });
   }
 
-  if (pathname === "/api/stream" && req.method === "GET") {
+  if (p === "/api/stream" && req.method === "GET") {
     res.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
+      "Content-Type": "text/event-stream", "Cache-Control": "no-cache",
+      Connection: "keep-alive", "Access-Control-Allow-Origin": "*",
     });
-
     state.sseClients.push(res);
-
-    // Send init event with current state
-    const initData = {
-      running: state.running,
-      goal: state.goal,
-      terminalCount: state.terminalCount,
-      model: state.model,
-      iterations: state.iterations,
-      currentIteration: state.currentIteration,
-      controllerOutput: state.controllerOutput,
-      sessions: state.sessions,
-    };
-    res.write(`event: init\ndata: ${JSON.stringify(initData)}\n\n`);
-
+    res.write(`event: init\ndata: ${JSON.stringify({
+      running: state.running, goal: state.goal, terminalCount: state.terminalCount,
+      model: state.model, iterations: state.iterations, currentIteration: state.currentIteration,
+      controllerOutput: state.controllerOutput, sessions: state.sessions,
+    })}\n\n`);
     req.on("close", () => {
-      const idx = state.sseClients.indexOf(res);
-      if (idx !== -1) state.sseClients.splice(idx, 1);
+      const i = state.sseClients.indexOf(res);
+      if (i !== -1) state.sseClients.splice(i, 1);
     });
     return;
   }
 
-  // --- Static Files ---
+  // ── Swarm Intelligence API ──
 
-  let filePath = pathname === "/" ? "/index.html" : pathname;
-  filePath = path.join(PUBLIC_DIR, filePath);
-
-  // Prevent directory traversal
-  if (!filePath.startsWith(PUBLIC_DIR)) {
-    res.writeHead(403);
-    return res.end("Forbidden");
+  if (p === "/api/swarm/state" && req.method === "GET") {
+    if (!state.reactor) return json(res, 200, { sessions: {}, progress: null });
+    return json(res, 200, state.reactor.getFullState());
   }
 
+  if (p === "/api/swarm/events" && req.method === "GET") {
+    if (!state.reactor) return json(res, 200, { events: [] });
+    return json(res, 200, {
+      events: state.reactor.getEventLog({
+        session: url.searchParams.get("session"),
+        type: url.searchParams.get("type"),
+        limit: parseInt(url.searchParams.get("limit")) || 200,
+      }),
+    });
+  }
+
+  if (p === "/api/swarm/resources" && req.method === "GET") {
+    if (!state.reactor) return json(res, 200, { resources: {} });
+    return json(res, 200, { resources: state.reactor.registry.snapshot() });
+  }
+
+  if (p === "/api/swarm/locks" && req.method === "GET") {
+    if (!state.reactor) return json(res, 200, { locks: {} });
+    return json(res, 200, { locks: state.reactor.locks.snapshot() });
+  }
+
+  if (p === "/api/swarm/acks" && req.method === "GET") {
+    if (!state.reactor) return json(res, 200, { stats: {}, pending: [] });
+    return json(res, 200, {
+      stats: state.reactor.acks.getStats(),
+      pending: state.reactor.acks.getPending(),
+    });
+  }
+
+  if (p === "/api/swarm/decisions" && req.method === "GET") {
+    if (!state.bridge) return json(res, 200, { decisions: [] });
+    return json(res, 200, { decisions: state.bridge.readFile("decisions.jsonl") });
+  }
+
+  if (p === "/api/swarm/outcomes" && req.method === "GET") {
+    if (!state.bridge) return json(res, 200, { outcomes: [] });
+    return json(res, 200, { outcomes: state.bridge.readFile("outcomes.jsonl") });
+  }
+
+  if (p === "/api/swarm/patterns" && req.method === "GET") {
+    if (!state.bridge) return json(res, 200, { patterns: [] });
+    return json(res, 200, { patterns: state.bridge.readFile("patterns.jsonl") });
+  }
+
+  if (p === "/api/swarm/runs" && req.method === "GET") {
+    // Historical run data — persists across server restarts
+    try {
+      const runsPath = path.join(SWARM_ROOT, "_decisions", "runs.jsonl");
+      const content = fs.readFileSync(runsPath, "utf-8").trim();
+      const runs = content ? content.split("\n").map((l) => {
+        try { return JSON.parse(l); } catch (_) { return null; }
+      }).filter(Boolean) : [];
+      return json(res, 200, { runs });
+    } catch (_) {
+      return json(res, 200, { runs: [] });
+    }
+  }
+
+  if (p === "/api/swarm/send" && req.method === "POST") {
+    if (!state.bus) return json(res, 400, { error: "No active swarm" });
+    const body = await parseBody(req);
+    if (!body.session || !body.message) return json(res, 400, { error: "session and message required" });
+    try { state.bus.send(body.session, body.message); return json(res, 200, { ok: true }); }
+    catch (e) { return json(res, 400, { error: e.message }); }
+  }
+
+  if (p === "/api/swarm/broadcast" && req.method === "POST") {
+    if (!state.bus) return json(res, 400, { error: "No active swarm" });
+    const body = await parseBody(req);
+    state.bus.broadcast(body.message || body);
+    return json(res, 200, { ok: true });
+  }
+
+  // ── Static ──
+
+  let fp = p === "/" ? "/index.html" : p;
+  fp = path.join(PUBLIC_DIR, fp);
+  if (!fp.startsWith(PUBLIC_DIR)) { res.writeHead(403); return res.end("Forbidden"); }
   try {
-    const stat = fs.statSync(filePath);
-    if (!stat.isFile()) throw new Error("Not a file");
-    const ext = path.extname(filePath);
-    const contentType = MIME_TYPES[ext] || "application/octet-stream";
-    const content = fs.readFileSync(filePath);
-    res.writeHead(200, { "Content-Type": contentType });
-    res.end(content);
-  } catch (_) {
-    res.writeHead(404);
-    res.end("Not Found");
-  }
+    if (!fs.statSync(fp).isFile()) throw 0;
+    res.writeHead(200, { "Content-Type": MIME[path.extname(fp)] || "application/octet-stream" });
+    res.end(fs.readFileSync(fp));
+  } catch (_) { res.writeHead(404); res.end("Not Found"); }
 });
 
 server.listen(PORT, () => {
-  console.log(`Dashboard: http://localhost:${PORT}`);
+  console.log(`Swarm Dashboard:    http://localhost:${PORT}`);
+  console.log(`Swarm bus root:     ${SWARM_ROOT}`);
+  console.log(`Decision store:     ${SWARM_ROOT}/_decisions/`);
+  console.log(`CLI helper:         ${CLI_PATH}`);
 });
