@@ -22,6 +22,7 @@ const { execSync, spawn } = require("child_process");
 const { SwarmBus, SWARM_ROOT } = require("./swarm-bus.cjs");
 const { SwarmReactor } = require("./swarm-reactor.cjs");
 const { DecisionBridge } = require("./decision-bridge.cjs");
+const { TmuxBridge } = require("./tmux-bridge.cjs");
 const { uuid } = require("./schema.cjs");
 
 const PORT = parseInt(process.env.PORT, 10) || 3456;
@@ -145,6 +146,7 @@ const state = {
   bus: null,
   reactor: null,
   bridge: null,
+  tmuxBridge: null,
 };
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -202,11 +204,18 @@ function initSubsystems() {
   state.bridge.on("pattern:compiled", (e) => broadcast("swarm:pattern", e));
   state.bridge.on("run:complete", (e) => broadcast("swarm:run_complete", e));
 
+  state.tmuxBridge = new TmuxBridge(state.bus, TMUX_CONTROL, SWARM_ROOT);
+  state.tmuxBridge.on("synthetic_event", (e) =>
+    broadcast("swarm:log", { level: "debug", session: e.session, message: `[tmux-bridge] ${e.type}` })
+  );
+
   state.reactor.start();
   state.bridge.start();
+  state.tmuxBridge.start();
 }
 
 function destroySubsystems() {
+  if (state.tmuxBridge) { state.tmuxBridge.stop(); state.tmuxBridge = null; }
   if (state.bridge) { state.bridge.stop(); state.bridge = null; }
   if (state.reactor) { state.reactor.stop(); state.reactor = null; }
   if (state.bus) { state.bus.destroy(); state.bus = null; }
